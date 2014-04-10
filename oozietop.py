@@ -1,6 +1,22 @@
+#!/usr/bin/env python
+
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from optparse import OptionParser
-
 import curses
 import threading, Queue
 import socket
@@ -8,11 +24,27 @@ import signal
 import re, StringIO
 import logging as LOG
 import time
+import sys
+import urllib
+import json
+import datetime
+from time import gmtime, strftime
+import urllib2_kerberos
+import urllib2
 
-
-LOG.disable(LOG.CRITICAL)
+LOG.basicConfig(filename="oozietop.log", level=LOG.DEBUG)
 
 resized_sig = False
+
+q_stats = Queue.Queue()
+
+p_wakeup = threading.Condition()
+
+
+def wakeup_poller():
+    p_wakeup.acquire()
+    p_wakeup.notifyAll()
+    p_wakeup.release()
 
 
 class BaseUI(object):
@@ -23,12 +55,12 @@ class BaseUI(object):
         self.resize(self.maxy, self.maxx)
 
     def resize(self, maxy, maxx):
-        LOG.debug("resize called y %d x %d" % (maxy, maxx))
+        #LOG.debug("resize called y %d x %d" % (maxy, maxx))
         self.maxy = maxy
         self.maxx = maxx
 
-    def addstr(self, y, x, line, flags = 0):
-        LOG.debug("addstr with maxx %d" % (self.maxx))
+    def addstr(self, y, x, line, flags=0):
+        #LOG.debug("addstr with maxx %d" % self.maxx)
         self.win.addstr(y, x, line[:self.maxx-1], flags)
         self.win.clrtoeol()
         self.win.noutrefresh()
@@ -36,15 +68,15 @@ class BaseUI(object):
 
 class SummaryUI(BaseUI):
     def __init__(self, height, width, server_count):
-        BaseUI.__init__(self, curses.newwin(1, width, 0, 0))
+        BaseUI.__init__(self, curses.newwin(50, width, 0, 0))
 
     def update(self):
         self.win.erase()
-        self.addstr(0, 0, "This is just a test")
+
 
 class Main(object):
-    def __init__(self):
-        pass
+    def __init__(self, oozie_server):
+        self.oozie_server = oozie_server
 
     def show_ui(self, stdscr):
         global mainwin
@@ -62,26 +94,46 @@ class Main(object):
         #server_count = len(self.servers)
         maxy, maxx = stdscr.getmaxyx()
         ui = SummaryUI(maxy, maxx, 5)
-        """# start the polling threads
-        pollers = [StatPoller(server) for server in self.servers]
-        for poller in pollers:
-            poller.setName("PollerThread:" + server)
-            poller.setDaemon(True)
-            poller.start()  """
+
 
         LOG.debug("starting main loop")
+
         global resized_sig
         flash = None
-
-
+        LOG.debug("Before main loop")
         while True:
+            row_count = 0
+            ui.addstr(0, 0, strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime()), curses.A_REVERSE)
+            ui.addstr(1, 0, "%-40s %-20s %-10s " % ("JOB ID", "NAME", "STATUS"), curses.A_REVERSE)
             if resized_sig:
                 resized_sig = False
                 self.resize(ui)
-            time.sleep(5)
+
+
+            try:
+                LOG.debug("Attempting poll...")
+                workflows = oozie_server.poll()
+                LOG.debug("Post poll...")
+                for workflow in workflows:
+                    #LOG.debug(workflow)
+                    try:
+                        ui.addstr(row_count + 2, 0, "%-40s %-20s %-10s" %
+                        (workflow[0], workflow[1], workflow[2]))
+                    except Exception as e:
+                        LOG.error("at workflow update")
+                        LOG.error(e)
+                    row_count += 1
+            except:
+                LOG.error("error connecting to oozie")
+                try:
+                    ui.addstr(row_count + 2, 0, "error connecting to oozie")
+                    row_count += 1
+                except:
+                    pass
             ui.update()
             stdscr.clrtoeol()
             curses.doupdate()
+            time.sleep(5)
 
     def resize(self, ui):
             curses.endwin()
@@ -90,7 +142,90 @@ class Main(object):
             global mainwin
             mainwin.refresh()
             maxy, maxx = mainwin.getmaxyx()
-            ui.resize(maxy, maxx)
+            try:
+                ui.resize(maxy, maxx)
+                ui.addstr(0, 0, strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime()), curses.A_REVERSE)
+                ui.addstr(1, 0, "%-40s %-20s %-10s " % ("JOB ID", "NAME", "STATUS"), curses.A_REVERSE)
+            except Exception as e:
+                LOG.error("error at resize")
+
+
+class OozieConnection(object):
+
+    def __init__(self, host, port, kinit_truth):
+
+        #get current timezone - This assumes Oozie has been setup for the system timezone
+        self.tz = strftime("%Z", gmtime())
+        self.host = host
+        self.port = port
+        self.kinit_truth = kinit_truth
+        self.uri = "http://" + host + ":" + port + "/oozie/v1/jobs?jobType=wf&timezone=%s" % self.tz
+        LOG.debug(self.uri)
+        self.failed_count = 0
+        self.suspended_count = 0
+        self.killed_count = 0
+        self.succeeded_count = 0
+        self.prep_count = 0
+        self.running_count = 0
+        self.workflows = []
+
+    def poll(self):
+        #If Kerberos, use urllib2/urllib2_kerberos, if not, use urllib
+        if self.kinit_truth == "true":
+            try:
+                opener = urllib2.build_opener()
+                opener.add_handler(urllib2_kerberos.HTTPKerberosAuthHandler())
+                resp = opener.open(self.uri)
+                json_response = resp.read()
+
+                #Create a JSON object
+            except:
+                LOG.error("Error connecting to the Oozie server with kerberos")
+            #Create a JSON object
+            try:
+                json_object = json.loads(json_response)
+            except:
+                LOG.error("Error parsing the JSON from Oozie")
+        else:
+            try:
+                raw_json = urllib.urlopen(self.uri)
+            except Exception as e:
+                LOG.error("Error connecting to the Oozie server " + e)
+
+            #Create a JSON object
+            try:
+                json_object = json.load(raw_json)
+            except:
+                LOG.error("Error parsing the JSON from Oozie")
+
+
+        #iterate through the json and pull out the workflows
+        for job in json_object[u'workflows']:
+            row = [job[u'id'], job[u'appName'], job[u'status'], job[u'endTime']]
+            self.workflows.append(row)
+
+        #iterate through the workflows and get status
+        for workflow in self.workflows:
+            if workflow[2] == "FAILED":
+                self.failed_count += 1
+
+            elif workflow[2] == "SUSPENDED":
+                self.suspended_count += 1
+
+            elif workflow[2] == "KILLED":
+                self.killed_count += 1
+
+            elif workflow[2] == "SUCCEEDED":
+                self.succeeded_count += 1
+
+            elif workflow[2] == "PREP":
+                self.prep_count += 1
+
+            elif workflow[2] == "RUNNING":
+                self.running_count += 1
+        #LOG.debug(self.workflows)
+        return self.workflows
+
 
 def sigwinch_handler(*nada):
     LOG.debug("sigwinch called")
@@ -99,6 +234,11 @@ def sigwinch_handler(*nada):
 
 if __name__ == '__main__':
     LOG.debug("startup")
+    if len(sys.argv) < 3:
+        #LOG.ERROR("Missing Hostname and port")
+        print "Missing hostname and port"
+        sys.exit(2)
+    oozie_server = OozieConnection(sys.argv[1], sys.argv[2], False)
 
-    ui = Main()
+    ui = Main(oozie_server)
     curses.wrapper(ui.show_ui)
