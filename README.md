@@ -4,9 +4,9 @@ oozietop
 Top like program for Oozie work flows
 
 
-This was inspired by github.com/phunt/zktop.
+This was inspired by [github.com/phunt/zktop](http://github.com/phunt/zktop)
 
-![oozietop Screenshot](/images/oozietoop-01.png "oozietop Screenshot")
+![oozietop Screenshot](/images/oozietop-01.png "oozietop Screenshot")
 
 To execute:
 ```bash
