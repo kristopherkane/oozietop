@@ -16,18 +16,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from optparse import OptionParser
 import curses
-import threading, Queue
-import socket
+import threading
+import Queue
 import signal
-import re, StringIO
 import logging as LOG
 import time
 import sys
 import urllib
 import json
-import datetime
 from time import gmtime, strftime
 import urllib2_kerberos
 import urllib2
@@ -84,10 +81,7 @@ class Main(object):
         curses.use_default_colors()
         # w/o this for some reason takes 1 cycle to draw wins
         stdscr.refresh()
-
         signal.signal(signal.SIGWINCH, sigwinch_handler)
-
-
         TIMEOUT = 250
         stdscr.timeout(TIMEOUT)
 
@@ -95,41 +89,29 @@ class Main(object):
         maxy, maxx = stdscr.getmaxyx()
         ui = SummaryUI(maxy, maxx, 5)
 
-
         LOG.debug("starting main loop")
 
         global resized_sig
         flash = None
-        LOG.debug("Before main loop")
         while True:
+            ui.win.erase()
             row_count = 0
-            ui.addstr(0, 0, strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime()), curses.A_REVERSE)
-            ui.addstr(1, 0, "%-40s %-20s %-10s " % ("JOB ID", "NAME", "STATUS"), curses.A_REVERSE)
+            ui.addstr(0, 0, strftime("%a, %d %b %Y %H:%M:%S +0500", gmtime()), curses.A_REVERSE)
+            ui.addstr(1, 0, "%-40s %-20s %-10s %-40s %-40s" % ("JOB ID", "NAME", "STATUS", "START TIME", "END TIME"), curses.A_REVERSE)
             if resized_sig:
                 resized_sig = False
                 self.resize(ui)
 
-
             try:
-                LOG.debug("Attempting poll...")
+                LOG.debug("Attempting poll of " + oozie_server.uri)
                 workflows = oozie_server.poll()
-                LOG.debug("Post poll...")
                 for workflow in workflows:
-                    #LOG.debug(workflow)
-                    try:
-                        ui.addstr(row_count + 2, 0, "%-40s %-20s %-10s" %
-                        (workflow[0], workflow[1], workflow[2]))
-                    except Exception as e:
-                        LOG.error("at workflow update")
-                        LOG.error(e)
+                    ui.addstr(row_count + 2, 0, "%-40s %-20s %-15s %-20s %-20s" %
+                    (workflow[0], workflow[1], workflow[2], workflow[3], workflow[4]))
                     row_count += 1
-            except:
-                LOG.error("error connecting to oozie")
-                try:
-                    ui.addstr(row_count + 2, 0, "error connecting to oozie")
-                    row_count += 1
-                except:
-                    pass
+            except Exception as e:
+                LOG.error(e)
+
             ui.update()
             stdscr.clrtoeol()
             curses.doupdate()
@@ -145,7 +127,7 @@ class Main(object):
             try:
                 ui.resize(maxy, maxx)
                 ui.addstr(0, 0, strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime()), curses.A_REVERSE)
-                ui.addstr(1, 0, "%-40s %-20s %-10s " % ("JOB ID", "NAME", "STATUS"), curses.A_REVERSE)
+                ui.addstr(1, 0, "%-40s %-20s %-10s %-40s %-40s" % ("JOB ID", "NAME", "STATUS", "START TIME", "END TIME"), curses.A_REVERSE)
             except Exception as e:
                 LOG.error("error at resize")
 
@@ -197,13 +179,11 @@ class OozieConnection(object):
                 json_object = json.load(raw_json)
             except:
                 LOG.error("Error parsing the JSON from Oozie")
-
-
+        self.workflows = []
         #iterate through the json and pull out the workflows
         for job in json_object[u'workflows']:
-            row = [job[u'id'], job[u'appName'], job[u'status'], job[u'endTime']]
+            row = [job[u'id'], job[u'appName'], job[u'status'], job[u'startTime'], job[u'endTime']]
             self.workflows.append(row)
-
         #iterate through the workflows and get status
         for workflow in self.workflows:
             if workflow[2] == "FAILED":
